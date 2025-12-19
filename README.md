@@ -17,6 +17,8 @@ Work in progress — detailed description coming soon
  
  1-5) 반복
 
+
+
 2) MNQ_MOT 제어신호 송출 (PWM 신호는 HIGH/LOW 아닌 PWM 제어, PWM 주파수는 16kHz)
    
  2-1) 0에서 255/255로 바로 주지말고, 1ms에 PWM 5씩 증가 (51ms면 255/255)
@@ -61,6 +63,8 @@ Work in progress — detailed description coming soon
         }
 ```
 
+
+
 3) MNQ 탄 감지 송출 [단순 high low 신호 보내기 / 기능은 넣어두되 사용은 추후에 할 수 있으니 주석처리만]
    
  3-1) 몸통샷 한 번이면 HIT_1 = high
@@ -72,6 +76,8 @@ Work in progress — detailed description coming soon
  3-4) MNQ_MOT가 내려가면 전부 LOW로 초기화
  
     - HIT_1 또는 HIT_2가 high일 때 HIT_3가 high가 되면 LOW로 초기화
+
+
 
 4) pico pin
    
@@ -102,6 +108,8 @@ Work in progress — detailed description coming soon
  gpio 13 = HIT_2
  
  gpio 14 = HIT_3
+
+
 
 ; 12/03 탄 감지 로직
 
