@@ -109,24 +109,3 @@ Work in progress — detailed description coming soon
  
  gpio 14 = HIT_3
 
-
-
-; 12/03 탄 감지 로직
-
-;  1-1) XTGT 피코는 신호 2개를 통해 헤드샷 또는 몸통샷을 판별함(신호 P1, P2).
-
-;  1-2) 먼저 P1이 LOW to HIGH 될 때를 감지하는데, 
-
-;    - P1이 HIGH임을 1ms 간격으로 5회 측정(총 5ms) 후 P1이 HIGH임을 확정.
-
-;  1-3) P1이 HIGH임을 확인하면, P1이 LOW로 변경될 때를 기다림.
-
-;    - P1이 LOW가 되는 즉시 P1이 LOW임을 확정.
-
-;  1-4) P2 신호 확인시작
-
-;    - P1 LOW 확정 후, 1ms delay 후 P2 확인시작 함
-
-;    - P2를 1ms 간격으로 2회 체크해서 P2가 HIGH 인지 LOW인지 확인
-
-;  1-5) P2가 HIGH이면 헤드샷, LOW이면 몸통샷으로 판별함.
