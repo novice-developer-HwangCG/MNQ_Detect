@@ -7,9 +7,9 @@ Work in progress — detailed description coming soon
  
  1-2) DETECT_1, DETECT_3는 몸통샷, DETECT_2는 헤드샷 [low to high 이후 low]
  
-    - 몸통샷은 DETECT_1 또는 DETECT_3 신호가 한 번 더 들어오면 내려가기
+    a) 몸통샷은 DETECT_1 또는 DETECT_3 신호가 한 번 더 들어오면 내려가기
     
-    - 헤드샷 은 DETECT_2 신호 한 번 들어오자 마자 내려가기
+    b) 헤드샷 은 DETECT_2 신호 한 번 들어오자 마자 내려가기
     
  1-3) 내려갔을 시 3초 대기(신호 받지 않음/high 신호 들어와도 무시) 후 다시 올라오기
  
@@ -27,9 +27,9 @@ Work in progress — detailed description coming soon
  
  2-3) 2.5초라면, 1.5초동안 255/255로 제어하고, 그 다음부터는 150/255로 제어할 것
  
-    - 단, 255 → 150은 1ms에 PWM 1씩 감소시킬 것 (105ms 소요)
+    a) 단, 255 → 150은 1ms에 PWM 1씩 감소시킬 것 (105ms 소요)
     
-    ※ 2초 수준이면 1.2초만 풀파워, 2.5초면 1.5초만 풀파워 등, 내려갈때 올라갈 때 모두 체크 필요
+    b) 2초 수준이면 1.2초만 풀파워, 2.5초면 1.5초만 풀파워 등, 내려갈때 올라갈 때 모두 체크 필요
     
  2-4) 엔드스탑 스위치신호 인식되면 150 → 0으로 1ms에 PWM 3씩 감소시킬 것 (스위치 닿고 멈추는데 50ms 소요)
  
@@ -75,7 +75,7 @@ Work in progress — detailed description coming soon
  
  3-4) MNQ_MOT가 내려가면 전부 LOW로 초기화
  
-    - HIT_1 또는 HIT_2가 high일 때 HIT_3가 high가 되면 LOW로 초기화
+    a) HIT_1 또는 HIT_2가 high일 때 HIT_3가 high가 되면 LOW로 초기화
 
 
 
