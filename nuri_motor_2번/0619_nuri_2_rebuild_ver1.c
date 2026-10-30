@@ -1,0 +1,1781 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "pico/time.h"
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+#include "hardware/irq.h"
+#include "hardware/clocks.h"
+#include "hardware/pwm.h"
+#include "hardware/sync.h"
+
+// P1_P2 신호 확인
+// 단순 85도 뒤로 넘어가기
+// NM-2 (NuriMotor-2)
+
+#define LED             PICO_DEFAULT_LED_PIN
+
+// --------------------- MOTOR UART 0 ---------------------
+#define UART_TX_PIN_MOTOR              (0)
+#define UART_RX_PIN_MOTOR              (1)
+
+#define UART_ID_MOTOR                  (uart0)
+#define MOTOR_BAUD_RATE                (9600)
+
+#define MOTOR_ID                       0x00     // 공장 초기 값
+
+// --------------------- SBC UART 1 ---------------------
+#define UART_TX_PIN_SBC                (8)
+#define UART_RX_PIN_SBC                (9)
+
+#define UART_ID_SBC                    (uart1)
+#define SBC_BAUD_RATE                  (115200)
+
+#define UART_START_FLAG                (0xff)
+#define UART_DATA_LENGTH               (9)
+
+static uint8_t Receive_Data[UART_DATA_LENGTH]  = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+static volatile uint        Receive_Done       = 0;
+static volatile uint        Receive_Data_Count = 0;
+static volatile uint8_t     Receive_Char       = 0;
+
+static bool control_signal = false;
+
+static absolute_time_t last_uart_time;
+static const uint32_t check_uart_time_out = 5000000;
+
+// --------------------- Detect Sensor ---------------------
+#define DETECT_1_P1        19
+#define DETECT_2_P2        20
+//#define DETECT_3        21
+#define GAIN               14
+
+#define P1_CONFIRM_US          5000u
+#define P2_CHECK1_US           1000u
+#define P2_CHECK2_US           2000u
+#define DETECT_COOLDOWN_US     80000u
+
+#define P2_HIST_SIZE           8
+#define P2_ACTIVE_NONE         0xFFu
+
+typedef enum {
+    SIG_IDLE = 0,
+    SIG_CONFIRM_P1,
+    SIG_WAIT_P1_FALL,
+    SIG_WAIT_P2_JUDGE,
+    SIG_COOLDOWN
+} signal_detect_state_t;
+
+typedef struct {
+    uint32_t rise_us;
+    uint32_t fall_us;
+    uint32_t rise_seq;
+    uint32_t fall_seq;
+    bool valid;
+    bool low_seen;
+} p2_pulse_t;
+
+typedef struct {
+    uint32_t p1_rise_us;
+    uint32_t p1_fall_us;
+    uint32_t p1_rise_seq;
+    uint32_t p1_fall_seq;
+    bool p1_high;
+
+    p2_pulse_t p2_hist[P2_HIST_SIZE];
+} signal_snapshot_t;
+
+// ISR 갱신값
+static volatile uint32_t sig_event_seq = 0;
+
+static volatile uint32_t isr_p1_rise_us = 0;
+static volatile uint32_t isr_p1_fall_us = 0;
+static volatile uint32_t isr_p1_rise_seq = 0;
+static volatile uint32_t isr_p1_fall_seq = 0;
+static volatile bool     isr_p1_high = false;
+
+static volatile bool     isr_p2_high = false;
+static volatile p2_pulse_t isr_p2_hist[P2_HIST_SIZE];
+static volatile uint8_t  isr_p2_write_idx = 0;
+static volatile uint8_t  isr_p2_active_idx = P2_ACTIVE_NONE;
+
+// main loop 상태값
+static signal_detect_state_t sig_state = SIG_IDLE;
+
+static uint32_t active_p1_rise_us = 0;
+static uint32_t active_p1_fall_us = 0;
+static uint32_t active_p1_rise_seq = 0;
+static uint32_t last_used_p1_rise_seq = 0;
+static uint32_t sig_cooldown_start_us = 0;
+
+volatile bool first_channel_ban = false;
+volatile bool second_channel_ban = false;
+
+static uint8_t default_gain_pwm = 65;
+static uint8_t current_gain_pwm = 65;
+
+volatile uint8_t cur_cri_set = 0;
+volatile uint8_t cri_hit_count = 0;
+
+volatile uint8_t cur_non_cri_set = 0;
+volatile uint8_t non_cri_hit_count = 0;
+
+static int hit_channel = 0;
+static float cur_deg = 0.0f;
+static uint8_t cur_abs_dir = 0x00;
+
+static uint8_t prev_mask = 0;
+static uint8_t prev_motor_ctrl = 0xFF;
+
+static uint8_t cur_mnq_rst_cmd = 0;
+
+static bool motor_on_state = false;
+static bool comm_hold_done = false;
+
+// --------------------- Non-blocking motor control / telemetry ---------------------
+/*
+ 코드 보완점 수정
+ - D9: 실제 기구 절대각 / 소프트리밋 / RST / 상대 이동량 계산의 기준
+ - D1: 상대 운전 피드백 0x03 속도제어 후 0도로 초기화되는 것이 확인되었으므로 
+       절대 위치 판정에는 사용하지 않고, 이동 중 속도/통신 상태 확인용으로만 사용
+ 
+ - sleep_ms()로 이동 완료를 기다리지 않음
+ - 0x02 위치 명령을 보낸 뒤 main loop에서 D9/D1을 주기적으로 비동기 수신
+ - D9로 도달 여부를 판정, UART0 프레임 수신도 main loop에서 조금씩 처리
+ */
+#define MOTOR_TELEMETRY_INTERVAL_MS       (100u)  // SBC로 hit, angle 송신 주기
+#define MOTOR_D9_POLL_INTERVAL_MS         (100u)  // 절대각 갱신 주기
+#define MOTOR_D1_POLL_INTERVAL_MS         (150u)  // 이동 중 D1 피드백 주기
+#define MOTOR_FEEDBACK_TIMEOUT_MS         (35u)   // D9/D1 응답 1회 대기 한도
+#define MOTOR_ENABLE_WAIT_MS              (120u)  // 제어 ON 후 안정화 시간
+#define MOTOR_MOVE_FEEDBACK_WAIT_MS       (500u)  // 시작/검증 D9 피드백 대기 한도
+#define MOTOR_SAFE_STOP_RAMP_MS           (250u)  // 0x03 0RPM 0.2s 이후 OFF 시점
+#define MOTOR_RX_FRAME_MAX                (32u)
+
+typedef struct {
+    bool valid;
+    uint8_t dir;          // 0x00=CCW, 0x01=CW
+    float pos_deg;        // 0.01 degree, 상대 운전 위치값
+    float speed_rpm;      // 0.1 RPM
+    float current_a;      // 0.1 A
+} motor_pos_feedback_t;
+
+typedef enum {
+    MOTOR_FB_NONE = 0,
+    MOTOR_FB_D9,
+    MOTOR_FB_D1
+} motor_feedback_req_t;
+
+typedef enum {
+    MOTOR_STATE_DISABLED = 0,
+    MOTOR_STATE_ENABLING,
+    MOTOR_STATE_READY,
+    MOTOR_STATE_WAIT_START_D9,
+    MOTOR_STATE_MOVING,
+    MOTOR_STATE_WAIT_VERIFY_D9,
+    MOTOR_STATE_SAFE_STOP_RAMP
+} motor_state_t;
+
+typedef enum {
+    MOTOR_MOVE_NONE = 0,
+    MOTOR_MOVE_UP,
+    MOTOR_MOVE_DOWN,
+    MOTOR_MOVE_RST
+} motor_move_kind_t;
+
+typedef struct {
+    motor_move_kind_t kind;
+    float target_deg;
+    float tol_deg;
+    float arrive_s;
+    bool allow_outside_limits;     // RST=true, 일반 UP/DOWN=false
+    uint8_t correction_count;
+    uint32_t wait_d9_seq;
+    uint32_t phase_start_ms;
+    uint32_t settle_deadline_ms;
+} motor_motion_t;
+
+static motor_state_t motor_state = MOTOR_STATE_DISABLED;
+static motor_motion_t motor_motion = {0};
+static motor_move_kind_t motor_last_completed = MOTOR_MOVE_NONE;
+static motor_move_kind_t motor_last_failed = MOTOR_MOVE_NONE;
+
+static uint32_t motor_enable_ready_ms = 0u;
+static uint32_t motor_safe_stop_off_ms = 0u;
+
+static uint8_t motor_rx_frame[MOTOR_RX_FRAME_MAX];
+static size_t motor_rx_idx = 0;
+static size_t motor_rx_total_len = 0;
+static motor_feedback_req_t motor_fb_pending = MOTOR_FB_NONE;
+static absolute_time_t motor_fb_request_time;
+
+static bool motor_d9_valid = false;
+static float motor_d9_raw_deg = 0.0f;
+static uint32_t motor_d9_seq = 0;
+static absolute_time_t motor_d9_update_time;
+static absolute_time_t motor_last_d9_request_time;
+static bool motor_last_d9_request_valid = false;
+
+static motor_pos_feedback_t motor_d1 = {0};
+static uint32_t motor_d1_seq = 0;
+static absolute_time_t motor_d1_update_time;
+static absolute_time_t motor_last_d1_request_time;
+static bool motor_last_d1_request_valid = false;
+
+static absolute_time_t motor_last_telemetry_time;
+static bool motor_last_telemetry_time_valid = false;
+static uint32_t motor_last_telemetry_d9_seq = 0;
+
+// --------------------- D9 absolute encoder target control ---------------------
+#define D9_TARGET_UP_DEG              (-6.5f)
+#define D9_TARGET_DOWN_DEG            (74.5f)
+
+#define D9_UP_TOL_DEG                 (1.0f)
+#define D9_DOWN_TOL_DEG               (3.0f)
+
+// 일반 UP/DOWN 동작 제한 범위
+#define D9_MIN_LIMIT_DEG              (-10.0f)
+#define D9_MAX_LIMIT_DEG              (85.0f)
+
+// RST 기준: UP 상태 -6.5도 ± 1.5도
+#define D9_RST_TOL_DEG                (1.5f)
+#define D9_UP_NORMAL_MIN_DEG          (D9_TARGET_UP_DEG - D9_RST_TOL_DEG)  // -8.0도
+#define D9_UP_NORMAL_MAX_DEG          (D9_TARGET_UP_DEG + D9_RST_TOL_DEG)  // -5.0도
+
+// 일반 UP/DOWN 이동 시간
+#define MOTOR_ARRIVE_TIME_S           (0.7f)
+
+// RST 복구 이동 시간
+#define MOTOR_RST_ARRIVE_TIME_S       (0.9f)
+
+#define MOTOR_MOVE_EXTRA_WAIT_MS      (800u)
+#define MOTOR_CORRECTION_COUNT        (1u)
+
+// MicroPython 실측 기준
+// D9 degree 증가 방향 = CW, D9 degree 감소 방향 = CCW
+#define D9_INCREASE_CMD_CW            (true)
+#define D9_DECREASE_CMD_CW            (false)
+
+typedef enum {
+    AUTO_SEQ_IDLE = 0,
+    AUTO_SEQ_MOVE_DOWN,
+    AUTO_SEQ_WAIT_DOWN,
+    AUTO_SEQ_MOVE_UP,
+    AUTO_SEQ_WAIT_UP
+} auto_seq_state_t;
+
+static auto_seq_state_t auto_seq_state = AUTO_SEQ_IDLE;
+
+// --------------------- Common set ---------------------
+#define DATA_BITS                       (8)
+#define STOP_BITS                       (1)
+#define PARITY                          (UART_PARITY_NONE)
+
+static char buffer[128];
+
+#define PICO_SYS_CLK_kHz                (125000)            // 125000 kHz
+#define PICO_SYS_CLK                    (125000000)
+
+// --------------------- Control (common) ---------------------
+#define MODE_POS_SPEED                  0x01   
+#define MODE_ACC_POS                    0x02
+#define MODE_ACC_SPEED                  0x03
+#define MODE_OPEN_LOOP                  0x11     // SA only
+
+// --------------------- Motor Settings (SA) ---------------------
+#define SA_MODE_SET_POS_CTRL     0x04   // 위치 제어기 설정
+#define SA_MODE_SET_SPD_CTRL     0x05   // 속도 제어기 설정
+#define SA_MODE_SET_ID           0x06   // ID 설정
+#define SA_MODE_SET_BAUD         0x07   // 통신 속도 설정
+#define SA_MODE_SET_RESPTIME     0x08   // 통신 응답시간 설정
+#define SA_MODE_SET_EXT_RATIO    0x09   // 외부 감속비 설정
+#define SA_MODE_SET_ONOFF        0x0A   // 제어 On/Off 설정
+#define SA_MODE_SET_POSMODE      0x0B   // 위치제어 모드 설정 (0x00 절대, 0x01 상대)
+#define SA_MODE_RESET_POS        0x0C   // 위치 초기화
+#define SA_MODE_RESET_FACTORY    0x0D   // 공장 초기화
+
+// --------------------- Motor Feedback Requests (SA) ---------------------
+#define SA_REQ_PING         0xA0   // Ping 요청
+#define SA_REQ_POS          0xA1   // 위치 피드백 요청
+#define SA_REQ_SPD          0xA2   // 속도 피드백 요청
+#define SA_REQ_POS_CTRL     0xA3   // 위치 제어기 피드백 요청
+#define SA_REQ_SPD_CTRL     0xA4   // 속도 제어기 피드백 요청
+#define SA_REQ_RESP_TIME    0xA5   // 통신 응답시간 피드백 요청
+#define SA_REQ_EXT_RATIO    0xA6   // 외부 감속비 피드백 요청
+#define SA_REQ_ONOFF        0xA7   // 제어 On/Off 피드백 요청
+#define SA_REQ_POSMODE      0xA8   // 위치제어 모드 피드백 요청
+#define SA_REQ_ABS_ENC      0xA9   // 절대 엔코더 피드백 요청
+#define SA_REQ_FIRMWARE     0xCD   // 펌웨어 버전 요청
+
+// --------------------- Motor Feedback Responses (SA) ---------------------
+#define SA_FEED_PING        0xD0    // ping 응답
+#define SA_FEED_POS         0xD1    // 위치 피드백 응답
+#define SA_FEED_SPD         0xD2    // 속도 피드백 응답
+#define SA_FEED_POS_CTRL    0xD3    // 위치 제어기 피드백 응답
+#define SA_FEED_SPD_CTRL    0xD4    // 속도 제어기 피드백 응답
+#define SA_FEED_RESP_TIME   0xD5    // 통신 응답시간 피드백 응답
+#define SA_FEED_EXT_RATIO   0xD6    // 외부 감속비 피드백 응답
+#define SA_FEED_ONOFF       0xD7    // 제어 on/off 피드백 응답
+#define SA_FEED_POSMODE     0xD8    // 위치 제어 모드 피드백 응답
+#define SA_FEED_ABS_ENC     0xD9    // 절대 엔코더 피드백 응답
+#define SA_FEED_FIRMWARE    0xFD    // 펌웨어 버전 응답
+
+// --------------------- Common function ---------------------
+void ConfigureUart_motor(void);
+void ConfigureUart_sbc(void);
+void ConfigureGpio_sensor(void);
+void StartSignal(void);
+void uart_timeout(void);
+
+void Rx_uart_SBC(void);
+void Tx_uart_SBC(int hit_channel, float cur_deg);
+
+// --------------------- Motor function ---------------------
+uint8_t calcChecksum(const uint8_t* frame, size_t len);
+size_t  buildFrame(uint8_t dev_id, uint8_t mode, const uint8_t* data, size_t data_len, uint8_t* out, size_t out_max);
+static void motor_send(uint8_t dev_id, uint8_t mode, const uint8_t* data, size_t data_len);
+static void motor_clear_rx(void);
+static float d9_to_signed_deg(uint8_t dir, float deg);
+
+void motor_set_onoff(uint8_t dev_id, bool on);
+void sa_set_posmode(uint8_t dev_id, bool absolute);
+void motor_reset_pos(uint8_t dev_id);
+void safe_stop(uint8_t dev_id);
+static void motor_hold_stop(uint8_t dev_id);
+
+int cmd_pos_speed(uint8_t dev_id, bool cw, float pos_deg, float spd_rpm);
+int cmd_acc_pos(uint8_t dev_id, bool cw, float pos_deg, float arrive_s);
+int cmd_acc_speed(uint8_t dev_id, bool cw, float spd_rpm, float arrive_s);
+int cmd_open_loop(uint8_t dev_id, bool cw, float duty_percent);
+
+static void motor_feedback_service(void);
+static void motor_motion_service(void);
+static void motor_telemetry_service(void);
+static void motor_request_enable(void);
+static void motor_request_safe_stop(void);
+static bool motor_request_move(motor_move_kind_t kind);
+static bool motor_motion_is_busy(void);
+static bool motor_take_completed(motor_move_kind_t kind);
+
+void start_motor_timer(void);
+bool check_motor_timer(uint32_t duration_ms);
+
+static void motor_up(void);
+static void motor_down(void);
+static bool motor_rst_recover(void);
+
+// --------------------- sensor function ---------------------
+static void gpio_irq_callback(uint gpio, uint32_t events);
+
+static void signal_detector_update(void);
+static void signal_detector_reset(void);
+static void clear_p2_history_irq_unsafe(uint32_t start_us);
+
+static void detect_channel_ban(void);
+void gain_pwm_set(uint8_t gain_pwm);
+
+//--------------------- Main ---------------------
+int main()
+{
+    set_sys_clock_khz(PICO_SYS_CLK_kHz, true);
+    busy_wait_ms(100);
+
+    ConfigureUart_sbc();
+    sleep_ms(10);
+
+    ConfigureUart_motor();
+    sleep_ms(10);
+
+    ConfigureGpio_sensor();
+    sleep_ms(10);
+
+    StartSignal();
+    last_uart_time = get_absolute_time();
+    sleep_ms(10);
+
+    //상대 위치제어 모드는 부팅 시 한 번만 설정
+    // 설정 명령은 EEPROM 반영 시간이 필요하므로 300ms를 확보
+    sa_set_posmode(MOTOR_ID, false);   // false = 상대 위치제어 모드
+    sleep_ms(300);
+
+    motor_set_onoff(MOTOR_ID, false);
+    sleep_ms(120);
+
+    while (true) {
+        tight_loop_contents();
+
+        // UART0 수신 프레임 처리 → 이동 상태 갱신 → D9 각도 송신 순서로 실행
+        // 0x02 위치 명령이 실행 중이어도 main loop와 센서 알고리즘은 계속 동작
+        motor_feedback_service();
+        motor_motion_service();
+        uart_timeout();
+
+        signal_detector_update();
+
+        if (Receive_Done > 0) {
+            Receive_Done = 0;
+            last_uart_time = get_absolute_time();
+
+            bool rst_handled = false;
+            comm_hold_done = false;
+
+            /*
+            Receive_Data[0] → 0 = 제어 off, 1 = on
+            Receive_Data[1] → 0 = 자동, 1 = 수동 UP, 2 = 수동 DOWN, 3 = target mode
+            Receive_Data[2] → 0 = 1 채널 on, 1 = 1 채널 off
+            Receive_Data[3] → 0 = 2 채널 on, 1 = 2 채널 off
+            Receive_Data[4] → 0 = 3 채널 on, 1 = 3 채널 off
+            Receive_Data[5] → Gain PWM
+            Receive_Data[5] → 0 ~ 254 = Gain PWM 값 적용 (감지 센서 민감도)
+            Receive_Data[6] → 0 ~ 9 치명상
+            Receive_Data[7] → 0 ~ 9 비치명상
+            Receive_Data[8] → 0 = None, 1 = RST (UP 복귀)
+            */
+            if (Receive_Data[0] == 0) {
+                control_signal = false;
+                prev_motor_ctrl = 0xFF;
+                auto_seq_state = AUTO_SEQ_IDLE;
+                signal_detector_reset();
+
+                if (!comm_hold_done) {
+                    motor_clear_motion_request();
+                    motor_hold_stop(MOTOR_ID);
+                    motor_state = MOTOR_STATE_READY;
+                    comm_hold_done = true;
+                }
+            }
+            else {
+                if (!motor_on_state && motor_state == MOTOR_STATE_DISABLED) {
+                    motor_request_enable();
+                }
+
+                detect_channel_ban();
+
+                if (Receive_Data[5] != current_gain_pwm) {
+                    gain_pwm_set(Receive_Data[5]);
+                }
+
+                if (Receive_Data[6] != cur_cri_set) {
+                    cur_cri_set = Receive_Data[6];
+                    cri_hit_count = 0;
+                }
+
+                if (Receive_Data[7] != cur_non_cri_set) {
+                    cur_non_cri_set = Receive_Data[7];
+                    non_cri_hit_count = 0;
+                }
+
+                //RST는 0 -> 1 전환에서 한 번만 실행
+                if (Receive_Data[8] != cur_mnq_rst_cmd) {
+                    cur_mnq_rst_cmd = Receive_Data[8];
+
+                    if (cur_mnq_rst_cmd == 1) {
+                        control_signal = false;
+                        auto_seq_state = AUTO_SEQ_IDLE;
+                        gpio_put(LED, 0);
+                        signal_detector_reset();
+
+                        // cri_hit_count = 0;
+                        // non_cri_hit_count = 0;
+
+                        (void)motor_rst_recover();
+
+                        prev_motor_ctrl = Receive_Data[1];
+                        rst_handled = true;
+                    }
+                }
+
+                if (!rst_handled) {
+                    // RST/UP/DOWN 이동 중에는 새 이동 명령을 겹쳐 보내지 않기
+                    if (motor_motion_is_busy()) {
+                        control_signal = false;
+                    }
+                    else if (Receive_Data[1] == 0) {
+                        // auto
+                        switch (auto_seq_state) {
+                        case AUTO_SEQ_IDLE:
+                            control_signal = true;
+
+                            if ((cur_cri_set > 0 && cri_hit_count >= cur_cri_set) ||
+                                (cur_non_cri_set > 0 && non_cri_hit_count >= cur_non_cri_set)) {
+
+                                control_signal = false;
+                                motor_last_completed = MOTOR_MOVE_NONE;
+
+                                if (motor_request_move(MOTOR_MOVE_DOWN)) {
+                                    gpio_put(LED, 1);
+                                    auto_seq_state = AUTO_SEQ_MOVE_DOWN;
+                                }
+                            }
+                            break;
+
+                        case AUTO_SEQ_MOVE_DOWN:
+                            control_signal = false;
+
+                            if (motor_take_completed(MOTOR_MOVE_DOWN)) {
+                                start_motor_timer();
+                                auto_seq_state = AUTO_SEQ_WAIT_DOWN;
+                            }
+                            break;
+
+                        case AUTO_SEQ_WAIT_DOWN:
+                            control_signal = false;
+
+                            if (check_motor_timer(1000)) {
+                                if (motor_request_move(MOTOR_MOVE_UP)) {
+                                    auto_seq_state = AUTO_SEQ_MOVE_UP;
+                                }
+                            }
+                            break;
+
+                        case AUTO_SEQ_MOVE_UP:
+                            control_signal = false;
+
+                            if (motor_take_completed(MOTOR_MOVE_UP)) {
+                                start_motor_timer();
+                                auto_seq_state = AUTO_SEQ_WAIT_UP;
+                            }
+                            break;
+
+                        case AUTO_SEQ_WAIT_UP:
+                            control_signal = false;
+
+                            if (check_motor_timer(1000)) {
+                                cri_hit_count = 0;
+                                non_cri_hit_count = 0;
+                                gpio_put(LED, 0);
+                                signal_detector_reset();
+                                auto_seq_state = AUTO_SEQ_IDLE;
+                                control_signal = true;
+                            }
+                            break;
+
+                        default:
+                            auto_seq_state = AUTO_SEQ_IDLE;
+                            control_signal = true;
+                            break;
+                        }
+
+                        prev_motor_ctrl = 0;
+                    }
+                    else if (Receive_Data[1] == 1 || Receive_Data[1] == 2) {
+                        // manual: 같은 명령이 반복 수신되어도 1회만 요청
+                        signal_detector_reset();
+                        auto_seq_state = AUTO_SEQ_IDLE;
+                        gpio_put(LED, 0);
+                        control_signal = false;
+
+                        if (Receive_Data[1] == 1) {
+                            if (prev_motor_ctrl != 1 && motor_request_move(MOTOR_MOVE_UP)) {
+                                prev_motor_ctrl = 1;
+                            }
+                        }
+                        else {
+                            if (prev_motor_ctrl != 2 && motor_request_move(MOTOR_MOVE_DOWN)) {
+                                prev_motor_ctrl = 2;
+                            }
+                        }
+                    }
+                    else if (Receive_Data[1] == 3) {
+                        // target mode: 알고리즘 대기
+                        prev_motor_ctrl = 3;
+                    }
+                    else {
+                        prev_motor_ctrl = 0xFF;
+                    }
+                }
+            }
+        }
+        motor_telemetry_service();
+
+        sleep_ms(1);
+    }
+
+    return 0;
+}
+
+// --------------------- SBC ---------------------
+void ConfigureUart_sbc(void)
+{
+    gpio_set_function(UART_TX_PIN_SBC, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN_SBC, GPIO_FUNC_UART);
+
+    uart_init(UART_ID_SBC, SBC_BAUD_RATE);
+    uart_set_hw_flow(UART_ID_SBC, false, false);
+    uart_set_format(UART_ID_SBC, DATA_BITS, STOP_BITS, PARITY);
+    uart_set_fifo_enabled(UART_ID_SBC, false);
+    
+    irq_set_exclusive_handler(UART1_IRQ, Rx_uart_SBC);
+    irq_set_enabled(UART1_IRQ, true);
+
+    uart_set_irq_enables(UART_ID_SBC, true, false);
+}
+
+void Rx_uart_SBC(void)
+{
+    irq_set_enabled(UART1_IRQ, false);
+
+    if (uart_is_readable_within_us(UART_ID_SBC, 100))
+    {
+        Receive_Char = uart_getc(UART_ID_SBC);
+    }
+
+    if (Receive_Char == UART_START_FLAG)
+    {
+        Receive_Data_Count = 0x0;
+    }
+    else
+    {
+        if (Receive_Data_Count < UART_DATA_LENGTH)
+        {
+            Receive_Data[Receive_Data_Count] = Receive_Char;
+
+            Receive_Data_Count++;
+
+            if (Receive_Data_Count == UART_DATA_LENGTH)
+            {
+                Receive_Done = 1;
+            }
+        }
+    }
+
+    irq_set_enabled(UART1_IRQ, true);
+}
+
+void Tx_uart_SBC(int hit_channel, float cur_deg)
+{
+    snprintf(buffer, sizeof(buffer), "%d, %.2f\n", hit_channel, cur_deg);
+    uart_puts(UART_ID_SBC, buffer);
+}
+
+// SBC 통신이 끊기면 0x03 감속 정지 후 0x0A OFF로 전환안하고 유지
+void uart_timeout(void)
+{
+    if (absolute_time_diff_us(last_uart_time, get_absolute_time()) >= check_uart_time_out) {
+        control_signal = false;
+        signal_detector_reset();
+        if (!comm_hold_done) {
+            control_signal = false;
+            auto_seq_state = AUTO_SEQ_IDLE;
+            signal_detector_reset();
+
+            motor_clear_motion_request();
+            motor_hold_stop(MOTOR_ID);
+            motor_state = MOTOR_STATE_READY;
+            comm_hold_done = true;
+        }
+    }
+}
+
+void StartSignal(void)
+{
+    gpio_put(LED, 1);
+    sleep_ms(1000);
+    gpio_put(LED, 0);
+}
+
+// --------------------- Motor ---------------------
+void ConfigureUart_motor(void)
+{
+    gpio_set_function(UART_TX_PIN_MOTOR, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN_MOTOR, GPIO_FUNC_UART);
+
+    uart_init(UART_ID_MOTOR, MOTOR_BAUD_RATE);
+    uart_set_hw_flow(UART_ID_MOTOR, false, false);
+    uart_set_format(UART_ID_MOTOR, DATA_BITS, STOP_BITS, PARITY);
+    uart_set_fifo_enabled(UART_ID_MOTOR, false);
+
+    // irq_set_exclusive_handler(UART0_IRQ, Rx_uart_motor);
+    // irq_set_enabled(UART0_IRQ, true);
+
+    // uart_set_irq_enables(UART_ID_MOTOR, true, false);
+}
+
+// --------------------- Motor function ---------------------
+// UART0는 인터럽트를 쓰지 않고 main loop에서 프레임을 조금씩 파싱
+// 따라서 D9/D1 응답 대기 동안에도 1.5초씩 멈추지 않으며, 센서/통신/텔레메트리가 지속
+
+static inline uint32_t motor_now_ms(void)
+{
+    return to_ms_since_boot(get_absolute_time());
+}
+
+static inline bool motor_time_reached(uint32_t deadline_ms)
+{
+    return (int32_t)(motor_now_ms() - deadline_ms) >= 0;
+}
+
+static inline uint16_t clamp_u16_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    if (v < lo) return (uint16_t)lo;
+    if (v > hi) return (uint16_t)hi;
+    return (uint16_t)v;
+}
+
+static inline uint8_t clamp_u8_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    if (v < lo) return (uint8_t)lo;
+    if (v > hi) return (uint8_t)hi;
+    return (uint8_t)v;
+}
+
+uint8_t calcChecksum(const uint8_t* frame, size_t len)
+{
+    uint32_t sum = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (i == 0 || i == 1 || i == 4) continue;
+        sum += frame[i];
+    }
+    return (uint8_t)(~(sum & 0xFF));
+}
+
+size_t buildFrame(uint8_t dev_id, uint8_t mode, const uint8_t* data,
+                  size_t data_len, uint8_t* out, size_t out_max)
+{
+    size_t total = 6u + data_len;
+    if (out_max < total) return 0;
+
+    out[0] = 0xFF;
+    out[1] = 0xFE;
+    out[2] = dev_id;
+    out[3] = (uint8_t)(1u + 1u + data_len);
+    out[4] = 0x00;
+    out[5] = mode;
+
+    if (data_len > 0u && data != NULL) {
+        memcpy(&out[6], data, data_len);
+    }
+
+    out[4] = calcChecksum(out, total);
+    return total;
+}
+
+static void motor_send(uint8_t dev_id, uint8_t mode, const uint8_t* data,
+                       size_t data_len)
+{
+    uint8_t frame[32];
+    size_t n = buildFrame(dev_id, mode, data, data_len, frame, sizeof(frame));
+    if (n == 0u) return;
+
+    uart_write_blocking(UART_ID_MOTOR, frame, n);
+}
+
+static void motor_clear_rx(void)
+{
+    while (uart_is_readable(UART_ID_MOTOR)) {
+        (void)uart_getc(UART_ID_MOTOR);
+    }
+}
+
+static float d9_to_signed_deg(uint8_t dir, float deg)
+{
+    // 2번 모터 실기구 검증값: D9 CW=음수, CCW=양수
+    return (dir == 0x01u) ? -deg : deg;
+}
+
+//0x01 위치+속도: [dir(1), pos(2), spd(2)]
+int cmd_pos_speed(uint8_t dev_id, bool cw, float pos_deg, float spd_rpm)
+{
+    int32_t pos_raw_i = (int32_t)lroundf(pos_deg * 100.0f);
+    int32_t spd_raw_i = (int32_t)lroundf(spd_rpm * 10.0f);
+
+    uint16_t pos_raw = clamp_u16_i32(pos_raw_i, 0, 65533);
+    uint16_t spd_raw = clamp_u16_i32(spd_raw_i, 0, 65533);
+
+    uint8_t d[5];
+    d[0] = (uint8_t)(cw ? 0x01 : 0x00);
+    d[1] = (uint8_t)((pos_raw >> 8) & 0xFF);
+    d[2] = (uint8_t)(pos_raw & 0xFF);
+    d[3] = (uint8_t)((spd_raw >> 8) & 0xFF);
+    d[4] = (uint8_t)(spd_raw & 0xFF);
+
+    motor_send(dev_id, MODE_POS_SPEED, d, sizeof(d));
+    return 0;
+}
+
+//0x02 가감속 위치: [dir(1), pos(2), arrive(1)]
+int cmd_acc_pos(uint8_t dev_id, bool cw, float pos_deg, float arrive_s)
+{
+    int32_t pos_raw_i = (int32_t)lroundf(pos_deg * 100.0f);
+    int32_t arr_raw_i = (int32_t)lroundf(arrive_s * 10.0f);
+
+    uint16_t pos_raw = clamp_u16_i32(pos_raw_i, 0, 65533);
+    uint8_t arr_raw = clamp_u8_i32(arr_raw_i, 1, 255);
+
+    uint8_t d[4];
+    d[0] = (uint8_t)(cw ? 0x01 : 0x00);
+    d[1] = (uint8_t)((pos_raw >> 8) & 0xFF);
+    d[2] = (uint8_t)(pos_raw & 0xFF);
+    d[3] = arr_raw;
+
+    motor_send(dev_id, MODE_ACC_POS, d, sizeof(d));
+    return 0;
+}
+
+//0x03 가감속 속도: [dir(1), spd(2), arrive(1)]
+int cmd_acc_speed(uint8_t dev_id, bool cw, float spd_rpm, float arrive_s)
+{
+    int32_t spd_raw_i = (int32_t)lroundf(spd_rpm * 10.0f);
+    int32_t arr_raw_i = (int32_t)lroundf(arrive_s * 10.0f);
+
+    uint16_t spd_raw = clamp_u16_i32(spd_raw_i, 0, 65533);
+    uint8_t arr_raw = clamp_u8_i32(arr_raw_i, 1, 255);
+
+    uint8_t d[4];
+    d[0] = (uint8_t)(cw ? 0x01 : 0x00);
+    d[1] = (uint8_t)((spd_raw >> 8) & 0xFF);
+    d[2] = (uint8_t)(spd_raw & 0xFF);
+    d[3] = arr_raw;
+
+    motor_send(dev_id, MODE_ACC_SPEED, d, sizeof(d));
+    return 0;
+}
+
+// 0x11 open-loop: [dir(1), duty(2)]
+int cmd_open_loop(uint8_t dev_id, bool cw, float duty_percent)
+{
+    int32_t duty_raw_i = (int32_t)lroundf(duty_percent * 100.0f);
+    uint16_t duty_raw = clamp_u16_i32(duty_raw_i, 0, 10000);
+
+    uint8_t d[3];
+    d[0] = (uint8_t)(cw ? 0x01 : 0x00);
+    d[1] = (uint8_t)((duty_raw >> 8) & 0xFF);
+    d[2] = (uint8_t)(duty_raw & 0xFF);
+
+    motor_send(dev_id, MODE_OPEN_LOOP, d, sizeof(d));
+    return 0;
+}
+
+// ON/OFF: 0x00=On, 0x01=Off
+void motor_set_onoff(uint8_t dev_id, bool on)
+{
+    uint8_t d[1] = { (uint8_t)(on ? 0x00 : 0x01) };
+    motor_send(dev_id, SA_MODE_SET_ONOFF, d, 1);
+}
+
+// 위치 초기화는 정상 운전 경로에서 사용하지 않음
+void motor_reset_pos(uint8_t dev_id)
+{
+    uint8_t d[1] = { 0x00 };
+    motor_send(dev_id, SA_MODE_RESET_POS, d, 1);
+}
+
+void sa_set_posmode(uint8_t dev_id, bool absolute)
+{
+    uint8_t d[1] = { (uint8_t)(absolute ? 0x00 : 0x01) };
+    motor_send(dev_id, SA_MODE_SET_POSMODE, d, 1);
+}
+
+// 0x03은 D1 상대 위치값을 0 부근으로 초기화
+// 따라서 정상 UP/DOWN/RST 완료 후에는 호출하지 않음
+// 제어 ON 직후 정지 토크 확보, 제한 위반 hold, 비상 정지에만 사용
+static void motor_hold_stop(uint8_t dev_id)
+{
+    cmd_acc_speed(dev_id, false, 0.0f, 0.2f);
+    motor_d1.valid = false;
+}
+
+void safe_stop(uint8_t dev_id)
+{
+    (void)dev_id;
+    motor_request_safe_stop();
+}
+
+/* --------------------- UART0 asynchronous feedback parser --------------------- */
+
+static void motor_rx_reset(void)
+{
+    motor_rx_idx = 0u;
+    motor_rx_total_len = 0u;
+}
+
+static void motor_handle_feedback_frame(const uint8_t *frame, size_t len)
+{
+    if (len < 6u || frame[2] != MOTOR_ID) {
+        return;
+    }
+
+    if (frame[5] == SA_FEED_ABS_ENC) {
+        /* FF FE ID 05 CHK D9 DIR ENC_H ENC_L */
+        if (len == 9u) {
+            uint16_t raw = ((uint16_t)frame[7] << 8) | frame[8];
+            cur_abs_dir = frame[6];
+            motor_d9_raw_deg = (float)raw / 100.0f;
+            cur_deg = d9_to_signed_deg(cur_abs_dir, motor_d9_raw_deg);
+            motor_d9_valid = true;
+            motor_d9_update_time = get_absolute_time();
+            motor_d9_seq++;
+
+            if (motor_fb_pending == MOTOR_FB_D9) {
+                motor_fb_pending = MOTOR_FB_NONE;
+            }
+        }
+        return;
+    }
+
+    if (frame[5] == SA_FEED_POS) {
+        /* FF FE ID 08 CHK D1 DIR POS_H POS_L SPD_H SPD_L CURRENT */
+        if (len == 12u) {
+            uint16_t pos_raw = ((uint16_t)frame[7] << 8) | frame[8];
+            uint16_t spd_raw = ((uint16_t)frame[9] << 8) | frame[10];
+
+            motor_d1.dir = frame[6];
+            motor_d1.pos_deg = (float)pos_raw / 100.0f;
+            motor_d1.speed_rpm = (float)spd_raw / 10.0f;
+            motor_d1.current_a = (float)frame[11] / 10.0f;
+            motor_d1.valid = true;
+            motor_d1_update_time = get_absolute_time();
+            motor_d1_seq++;
+
+            if (motor_fb_pending == MOTOR_FB_D1) {
+                motor_fb_pending = MOTOR_FB_NONE;
+            }
+        }
+    }
+}
+
+static void motor_rx_push_byte(uint8_t b)
+{
+    if (motor_rx_idx == 0u) {
+        if (b == 0xFFu) {
+            motor_rx_frame[motor_rx_idx++] = b;
+        }
+        return;
+    }
+
+    if (motor_rx_idx == 1u) {
+        if (b == 0xFEu) {
+            motor_rx_frame[motor_rx_idx++] = b;
+        }
+        else if (b == 0xFFu) {
+            motor_rx_frame[0] = 0xFFu;
+            motor_rx_idx = 1u;
+        }
+        else {
+            motor_rx_reset();
+        }
+        return;
+    }
+
+    if (motor_rx_idx >= MOTOR_RX_FRAME_MAX) {
+        motor_rx_reset();
+        return;
+    }
+
+    motor_rx_frame[motor_rx_idx++] = b;
+
+    if (motor_rx_idx == 4u) {
+        motor_rx_total_len = (size_t)motor_rx_frame[3] + 4u;
+        if (motor_rx_total_len < 6u || motor_rx_total_len > MOTOR_RX_FRAME_MAX) {
+            motor_rx_reset();
+            return;
+        }
+    }
+
+    if (motor_rx_total_len > 0u && motor_rx_idx >= motor_rx_total_len) {
+        if (calcChecksum(motor_rx_frame, motor_rx_total_len) == motor_rx_frame[4]) {
+            motor_handle_feedback_frame(motor_rx_frame, motor_rx_total_len);
+        }
+        motor_rx_reset();
+    }
+}
+
+static bool motor_feedback_begin_request(motor_feedback_req_t req)
+{
+    if (motor_fb_pending != MOTOR_FB_NONE) {
+        return false;
+    }
+
+    uint8_t mode = (req == MOTOR_FB_D9) ? SA_REQ_ABS_ENC : SA_REQ_POS;
+    uint8_t frame[8];
+    size_t n = buildFrame(MOTOR_ID, mode, NULL, 0u, frame, sizeof(frame));
+    if (n == 0u) {
+        return false;
+    }
+
+    motor_clear_rx();
+    motor_rx_reset();
+    uart_write_blocking(UART_ID_MOTOR, frame, n);
+
+    motor_fb_pending = req;
+    motor_fb_request_time = get_absolute_time();
+
+    if (req == MOTOR_FB_D9) {
+        motor_last_d9_request_time = motor_fb_request_time;
+        motor_last_d9_request_valid = true;
+    }
+    else {
+        motor_last_d1_request_time = motor_fb_request_time;
+        motor_last_d1_request_valid = true;
+    }
+
+    return true;
+}
+
+static bool motor_d9_request_due(absolute_time_t now)
+{
+    if ((motor_state == MOTOR_STATE_WAIT_START_D9 ||
+         motor_state == MOTOR_STATE_WAIT_VERIFY_D9) &&
+        motor_d9_seq == motor_motion.wait_d9_seq) {
+        return true;
+    }
+
+    if (!motor_last_d9_request_valid) {
+        return true;
+    }
+
+    return absolute_time_diff_us(motor_last_d9_request_time, now) >=
+           ((int64_t)MOTOR_D9_POLL_INTERVAL_MS * 1000ll);
+}
+
+static bool motor_d1_request_due(absolute_time_t now)
+{
+    if (motor_state != MOTOR_STATE_MOVING) {
+        return false;
+    }
+
+    if (!motor_last_d1_request_valid) {
+        return true;
+    }
+
+    return absolute_time_diff_us(motor_last_d1_request_time, now) >=
+           ((int64_t)MOTOR_D1_POLL_INTERVAL_MS * 1000ll);
+}
+
+static void motor_feedback_service(void)
+{
+    while (uart_is_readable(UART_ID_MOTOR)) {
+        motor_rx_push_byte(uart_getc(UART_ID_MOTOR));
+    }
+
+    absolute_time_t now = get_absolute_time();
+
+    if (motor_fb_pending != MOTOR_FB_NONE &&
+        absolute_time_diff_us(motor_fb_request_time, now) >=
+            ((int64_t)MOTOR_FEEDBACK_TIMEOUT_MS * 1000ll)) {
+        // 응답 1회 누락은 즉시 안전정지하지 않고, 다음 poll에서 재요청
+        motor_fb_pending = MOTOR_FB_NONE;
+        motor_rx_reset();
+    }
+
+    if (motor_fb_pending == MOTOR_FB_NONE) {
+        if (motor_d9_request_due(now)) {
+            (void)motor_feedback_begin_request(MOTOR_FB_D9);
+        }
+        else if (motor_d1_request_due(now)) {
+            (void)motor_feedback_begin_request(MOTOR_FB_D1);
+        }
+    }
+}
+
+/* --------------------- motion state machine --------------------- */
+
+static bool motor_motion_is_busy(void)
+{
+    return motor_state == MOTOR_STATE_WAIT_START_D9 ||
+           motor_state == MOTOR_STATE_MOVING ||
+           motor_state == MOTOR_STATE_WAIT_VERIFY_D9;
+}
+
+static void motor_clear_motion_request(void)
+{
+    motor_motion.kind = MOTOR_MOVE_NONE;
+    motor_motion.target_deg = 0.0f;
+    motor_motion.tol_deg = 0.0f;
+    motor_motion.arrive_s = 0.0f;
+    motor_motion.allow_outside_limits = false;
+    motor_motion.correction_count = 0u;
+    motor_motion.wait_d9_seq = motor_d9_seq;
+}
+
+static void motor_begin_wait_start_d9(void)
+{
+    motor_motion.wait_d9_seq = motor_d9_seq;
+    motor_motion.phase_start_ms = motor_now_ms();
+    motor_state = MOTOR_STATE_WAIT_START_D9;
+}
+
+static void motor_mark_failed(bool hard_stop)
+{
+    motor_last_failed = motor_motion.kind;
+    motor_clear_motion_request();
+
+    if (hard_stop) {
+        motor_request_safe_stop();
+    }
+    else {
+        // 정상 범위 위반은 RST를 막지 않도록 제어 ON 상태를 유지
+        motor_hold_stop(MOTOR_ID);
+        motor_state = MOTOR_STATE_READY;
+    }
+}
+
+static void motor_mark_completed(void)
+{
+    motor_last_completed = motor_motion.kind;
+    motor_clear_motion_request();
+    motor_state = MOTOR_STATE_READY;
+}
+
+static bool motor_take_completed(motor_move_kind_t kind)
+{
+    if (motor_last_completed != kind) {
+        return false;
+    }
+
+    motor_last_completed = MOTOR_MOVE_NONE;
+    return true;
+}
+
+static bool motor_calc_d9_move(float current_deg, float target_deg,
+                               float *move_deg, bool *move_cw,
+                               float *predicted_deg)
+{
+    if (move_deg == NULL || move_cw == NULL || predicted_deg == NULL) {
+        return false;
+    }
+
+    float diff = target_deg - current_deg;
+
+    if (diff > 0.0f) {
+        *move_cw = D9_INCREASE_CMD_CW;
+        *move_deg = diff;
+    }
+    else {
+        *move_cw = D9_DECREASE_CMD_CW;
+        *move_deg = -diff;
+    }
+
+    *predicted_deg = current_deg + diff;
+    return true;
+}
+
+static void motor_issue_position_from_latest_d9(void)
+{
+    if (!motor_d9_valid) {
+        motor_mark_failed(true);
+        return;
+    }
+
+    float current = cur_deg;
+    float target = motor_motion.target_deg;
+
+    if (!motor_motion.allow_outside_limits) {
+        if (current < D9_MIN_LIMIT_DEG || current >= D9_MAX_LIMIT_DEG ||
+            target < D9_MIN_LIMIT_DEG || target >= D9_MAX_LIMIT_DEG) {
+            motor_mark_failed(false);
+            return;
+        }
+
+        // UP 정상범위보다 더 아래로 떨어졌다면 DOWN 금지, RST만 허용
+        if (motor_motion.kind == MOTOR_MOVE_DOWN &&
+            current <= D9_UP_NORMAL_MIN_DEG) {
+            motor_mark_failed(false);
+            return;
+        }
+    }
+
+    float err = fabsf(target - current);
+    if (err <= motor_motion.tol_deg) {
+        motor_mark_completed();
+        return;
+    }
+
+    float move_deg = 0.0f;
+    float predicted_deg = 0.0f;
+    bool move_cw = false;
+
+    if (!motor_calc_d9_move(current, target, &move_deg, &move_cw, &predicted_deg) ||
+        move_deg < 0.01f) {
+        motor_mark_completed();
+        return;
+    }
+
+    if (!motor_motion.allow_outside_limits &&
+        (predicted_deg < D9_MIN_LIMIT_DEG || predicted_deg >= D9_MAX_LIMIT_DEG)) {
+        motor_mark_failed(false);
+        return;
+    }
+
+    cmd_acc_pos(MOTOR_ID, move_cw, move_deg, motor_motion.arrive_s);
+
+    motor_motion.settle_deadline_ms = motor_now_ms() +
+        (uint32_t)(motor_motion.arrive_s * 1000.0f) + MOTOR_MOVE_EXTRA_WAIT_MS;
+    motor_state = MOTOR_STATE_MOVING;
+}
+
+static bool motor_request_move(motor_move_kind_t kind)
+{
+    if (kind == MOTOR_MOVE_NONE || motor_state == MOTOR_STATE_SAFE_STOP_RAMP ||
+        motor_state == MOTOR_STATE_DISABLED) {
+        return false;
+    }
+
+    if (motor_motion_is_busy()) {
+        return false;
+    }
+
+    motor_clear_motion_request();
+    motor_motion.kind = kind;
+
+    switch (kind) {
+    case MOTOR_MOVE_UP:
+        motor_motion.target_deg = D9_TARGET_UP_DEG;
+        motor_motion.tol_deg = D9_UP_TOL_DEG;
+        motor_motion.arrive_s = MOTOR_ARRIVE_TIME_S;
+        motor_motion.allow_outside_limits = false;
+        break;
+
+    case MOTOR_MOVE_DOWN:
+        motor_motion.target_deg = D9_TARGET_DOWN_DEG;
+        motor_motion.tol_deg = D9_DOWN_TOL_DEG;
+        motor_motion.arrive_s = MOTOR_ARRIVE_TIME_S;
+        motor_motion.allow_outside_limits = false;
+        break;
+
+    case MOTOR_MOVE_RST:
+        motor_motion.target_deg = D9_TARGET_UP_DEG;
+        motor_motion.tol_deg = D9_RST_TOL_DEG;
+        motor_motion.arrive_s = MOTOR_RST_ARRIVE_TIME_S;
+        motor_motion.allow_outside_limits = true;
+        break;
+
+    default:
+        motor_clear_motion_request();
+        return false;
+    }
+
+    if (motor_state == MOTOR_STATE_ENABLING) {
+        // ON 안정화 완료 후 자동으로 D9 확인을 시작
+        return true;
+    }
+
+    if (motor_state != MOTOR_STATE_READY) {
+        motor_clear_motion_request();
+        return false;
+    }
+
+    motor_begin_wait_start_d9();
+    return true;
+}
+
+static void motor_request_enable(void)
+{
+    if (motor_state != MOTOR_STATE_DISABLED) {
+        return;
+    }
+
+    motor_set_onoff(MOTOR_ID, true);
+    motor_enable_ready_ms = motor_now_ms() + MOTOR_ENABLE_WAIT_MS;
+    motor_state = MOTOR_STATE_ENABLING;
+}
+
+static void motor_request_safe_stop(void)
+{
+    if (motor_state == MOTOR_STATE_DISABLED ||
+        motor_state == MOTOR_STATE_SAFE_STOP_RAMP) {
+        return;
+    }
+
+    motor_clear_motion_request();
+    motor_hold_stop(MOTOR_ID);  // 0x03, 0RPM, 0.2s
+    motor_safe_stop_off_ms = motor_now_ms() + MOTOR_SAFE_STOP_RAMP_MS;
+    motor_state = MOTOR_STATE_SAFE_STOP_RAMP;
+}
+
+static void motor_motion_service(void)
+{
+    uint32_t now_ms = motor_now_ms();
+
+    switch (motor_state) {
+    case MOTOR_STATE_ENABLING:
+        if (motor_time_reached(motor_enable_ready_ms)) {
+            motor_on_state = true;
+            motor_state = MOTOR_STATE_READY;
+
+            if (motor_motion.kind != MOTOR_MOVE_NONE) {
+                motor_begin_wait_start_d9();
+            }
+            else {
+                // 기존 코드의 제어 ON 직후 hold 동작을 유지하되 long sleep은 제거
+                motor_hold_stop(MOTOR_ID);
+            }
+        }
+        break;
+
+    case MOTOR_STATE_WAIT_START_D9:
+        if (motor_d9_seq != motor_motion.wait_d9_seq) {
+            motor_issue_position_from_latest_d9();
+        }
+        else if ((uint32_t)(now_ms - motor_motion.phase_start_ms) >=
+                 MOTOR_MOVE_FEEDBACK_WAIT_MS) {
+            motor_mark_failed(true);
+        }
+        break;
+
+    case MOTOR_STATE_MOVING:
+        if (motor_time_reached(motor_motion.settle_deadline_ms)) {
+            motor_motion.wait_d9_seq = motor_d9_seq;
+            motor_motion.phase_start_ms = now_ms;
+            motor_state = MOTOR_STATE_WAIT_VERIFY_D9;
+        }
+        break;
+
+    case MOTOR_STATE_WAIT_VERIFY_D9:
+        if (motor_d9_seq != motor_motion.wait_d9_seq) {
+            float err = fabsf(cur_deg - motor_motion.target_deg);
+
+            if (err <= motor_motion.tol_deg) {
+                // 정상 도달 후 0x03을 보내지 않음, 0x02 위치제어 상태가 목표 위치를 유지
+                motor_mark_completed();
+            }
+            else if (motor_motion.correction_count < MOTOR_CORRECTION_COUNT) {
+                motor_motion.correction_count++;
+                motor_issue_position_from_latest_d9();
+            }
+            else {
+                motor_mark_failed(true);
+            }
+        }
+        else if ((uint32_t)(now_ms - motor_motion.phase_start_ms) >=
+                 MOTOR_MOVE_FEEDBACK_WAIT_MS) {
+            motor_mark_failed(true);
+        }
+        break;
+
+    case MOTOR_STATE_SAFE_STOP_RAMP:
+        if (motor_time_reached(motor_safe_stop_off_ms)) {
+            motor_set_onoff(MOTOR_ID, false);
+            motor_on_state = false;
+            motor_state = MOTOR_STATE_DISABLED;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* --------------------- public UP/DOWN/RST entry --------------------- */
+
+static void motor_down(void)
+{
+    (void)motor_request_move(MOTOR_MOVE_DOWN);
+}
+
+static void motor_up(void)
+{
+    (void)motor_request_move(MOTOR_MOVE_UP);
+}
+
+static bool motor_rst_recover(void)
+{
+    return motor_request_move(MOTOR_MOVE_RST);
+}
+
+/* --------------------- continuous telemetry --------------------- */
+
+static void motor_telemetry_service(void)
+{
+    absolute_time_t now = get_absolute_time();
+    bool d9_changed = (motor_d9_seq != motor_last_telemetry_d9_seq);
+    bool interval_due = !motor_last_telemetry_time_valid ||
+        absolute_time_diff_us(motor_last_telemetry_time, now) >=
+            ((int64_t)MOTOR_TELEMETRY_INTERVAL_MS * 1000ll);
+
+    if (hit_channel != 0 || d9_changed || interval_due) {
+        Tx_uart_SBC(hit_channel, cur_deg);
+
+        hit_channel = 0;
+        motor_last_telemetry_d9_seq = motor_d9_seq;
+        motor_last_telemetry_time = now;
+        motor_last_telemetry_time_valid = true;
+    }
+}
+
+static absolute_time_t motor_timer_start_time;
+
+void start_motor_timer(void)
+{
+    motor_timer_start_time = get_absolute_time();
+}
+
+bool check_motor_timer(uint32_t duration_ms)
+{
+    int64_t diff_us = absolute_time_diff_us(motor_timer_start_time, get_absolute_time());
+    return diff_us >= ((int64_t)duration_ms * 1000ll);
+}
+
+// --------------------- Sensor ---------------------
+void ConfigureGpio_sensor(void)
+{
+    const float pwm_freq_hz = 5000.0f;
+
+    gpio_init(LED);
+    gpio_set_dir(LED, GPIO_OUT);
+
+    gpio_init(DETECT_1_P1);
+    gpio_set_dir(DETECT_1_P1, GPIO_IN);
+    gpio_pull_down(DETECT_1_P1);
+    gpio_set_irq_enabled_with_callback(DETECT_1_P1, GPIO_IRQ_EDGE_FALL|GPIO_IRQ_EDGE_RISE, true, &gpio_irq_callback);
+
+    gpio_init(DETECT_2_P2);
+    gpio_set_dir(DETECT_2_P2, GPIO_IN);
+    gpio_pull_down(DETECT_2_P2);
+    gpio_set_irq_enabled(DETECT_2_P2, GPIO_IRQ_EDGE_FALL|GPIO_IRQ_EDGE_RISE, true);
+
+    // gpio_init(DETECT_3);
+    // gpio_set_dir(DETECT_3, GPIO_IN);
+    // gpio_pull_down(DETECT_3);
+    // gpio_set_irq_enabled(DETECT_3, GPIO_IRQ_EDGE_FALL|GPIO_IRQ_EDGE_RISE, true);
+
+    gpio_set_function(GAIN, GPIO_FUNC_PWM);
+    uint gain_slice_num = pwm_gpio_to_slice_num(GAIN);
+
+    pwm_set_wrap(gain_slice_num, 255);
+
+    float div = (float)PICO_SYS_CLK / ((255 + 1.0f) * pwm_freq_hz);
+    if (div < 1.0f) div = 1.0f;
+    if (div > 255.0f) div = 255.0f;
+
+    pwm_set_clkdiv(gain_slice_num, div);
+    pwm_set_gpio_level(GAIN, 0);
+
+    pwm_set_enabled(gain_slice_num, true);
+
+    pwm_set_gpio_level(GAIN, default_gain_pwm);
+}
+
+static void gpio_irq_callback(uint gpio, uint32_t events)
+{
+    uint32_t now = time_us_32();
+
+    if (gpio == DETECT_1_P1) {
+        // P1 RISE
+        if (events & GPIO_IRQ_EDGE_RISE) {
+            if (isr_p1_high) {
+                return;   // 중복 RISE 무시
+            }
+
+            uint32_t seq = ++sig_event_seq;
+
+            isr_p1_rise_us = now;
+            isr_p1_rise_seq = seq;
+            isr_p1_high = true;
+            /*
+            * 중요:
+            * P1 RISE 순간에 P2 history를 초기화해야 함
+            * main loop에서 나중에 초기화하면 이미 잡힌 P2 pulse를 지워버릴 수 있음
+            */
+            clear_p2_history_irq_unsafe(now);
+        }
+
+        // P1 FALL
+        if (events & GPIO_IRQ_EDGE_FALL) {
+            if (!isr_p1_high) {
+                return;   // 중복 FALL 무시
+            }
+
+            uint32_t seq = ++sig_event_seq;
+
+            isr_p1_fall_us = now;
+            isr_p1_fall_seq = seq;
+            isr_p1_high = false;
+        }
+    }
+    else if (gpio == DETECT_2_P2) {
+        // P2 RISE
+        if (events & GPIO_IRQ_EDGE_RISE) {
+            if (isr_p2_high) {
+                return;   // 중복 RISE 무시
+            }
+
+            uint32_t seq = ++sig_event_seq;
+
+            uint8_t idx = isr_p2_write_idx;
+            isr_p2_write_idx = (uint8_t)((isr_p2_write_idx + 1u) % P2_HIST_SIZE);
+            isr_p2_active_idx = idx;
+
+            isr_p2_hist[idx].rise_us = now;
+            isr_p2_hist[idx].fall_us = 0;
+            isr_p2_hist[idx].rise_seq = seq;
+            isr_p2_hist[idx].fall_seq = 0;
+            isr_p2_hist[idx].valid = true;
+            isr_p2_hist[idx].low_seen = false;
+
+            isr_p2_high = true;
+        }
+
+        // P2 FALL
+        if (events & GPIO_IRQ_EDGE_FALL) {
+            if (!isr_p2_high) {
+                return;   // 중복 FALL 무시
+            }
+
+            uint32_t seq = ++sig_event_seq;
+
+            if (isr_p2_active_idx != P2_ACTIVE_NONE) {
+                uint8_t idx = isr_p2_active_idx;
+
+                isr_p2_hist[idx].fall_us = now;
+                isr_p2_hist[idx].fall_seq = seq;
+                isr_p2_hist[idx].low_seen = true;
+
+                isr_p2_active_idx = P2_ACTIVE_NONE;
+            }
+
+            isr_p2_high = false;
+        }
+    }
+}
+
+static inline bool time_after_eq_u32(uint32_t a, uint32_t b)
+{
+    return (int32_t)(a - b) >= 0;
+}
+
+static inline bool time_reached_u32(uint32_t now, uint32_t target)
+{
+    return (int32_t)(now - target) >= 0;
+}
+
+static void signal_get_snapshot(signal_snapshot_t *s)
+{
+    uint32_t irq = save_and_disable_interrupts();
+
+    s->p1_rise_us = isr_p1_rise_us;
+    s->p1_fall_us = isr_p1_fall_us;
+    s->p1_rise_seq = isr_p1_rise_seq;
+    s->p1_fall_seq = isr_p1_fall_seq;
+    s->p1_high = isr_p1_high;
+
+    for (int i = 0; i < P2_HIST_SIZE; i++) {
+        s->p2_hist[i].rise_us = isr_p2_hist[i].rise_us;
+        s->p2_hist[i].fall_us = isr_p2_hist[i].fall_us;
+        s->p2_hist[i].rise_seq = isr_p2_hist[i].rise_seq;
+        s->p2_hist[i].fall_seq = isr_p2_hist[i].fall_seq;
+        s->p2_hist[i].valid = isr_p2_hist[i].valid;
+        s->p2_hist[i].low_seen = isr_p2_hist[i].low_seen;
+    }
+
+    restore_interrupts(irq);
+}
+
+static void clear_p2_history_irq_unsafe(uint32_t start_us)
+{
+    for (int i = 0; i < P2_HIST_SIZE; i++) {
+        isr_p2_hist[i].rise_us = 0;
+        isr_p2_hist[i].fall_us = 0;
+        isr_p2_hist[i].rise_seq = 0;
+        isr_p2_hist[i].fall_seq = 0;
+        isr_p2_hist[i].valid = false;
+        isr_p2_hist[i].low_seen = false;
+    }
+
+    isr_p2_write_idx = 0;
+    isr_p2_active_idx = P2_ACTIVE_NONE;
+
+    /*
+     * P1 RISE 순간에 P2가 이미 High라면,
+     * P2가 P1보다 먼저 올라와서 아직 유지 중인 것으로 보고
+     * 열린 pulse를 하나 만들어두기
+     */
+    isr_p2_high = gpio_get(DETECT_2_P2);
+
+    if (isr_p2_high) {
+        uint32_t seq = ++sig_event_seq;
+
+        uint8_t idx = 0;
+        isr_p2_hist[idx].rise_us = start_us;
+        isr_p2_hist[idx].fall_us = 0;
+        isr_p2_hist[idx].rise_seq = seq;
+        isr_p2_hist[idx].fall_seq = 0;
+        isr_p2_hist[idx].valid = true;
+        isr_p2_hist[idx].low_seen = false;
+
+        isr_p2_write_idx = 1;
+        isr_p2_active_idx = idx;
+    }
+}
+
+static bool p2_was_high_at_time(const signal_snapshot_t *s, uint32_t check_us)
+{
+    for (int i = 0; i < P2_HIST_SIZE; i++) {
+        const p2_pulse_t *p = &s->p2_hist[i];
+
+        if (!p->valid) {
+            continue;
+        }
+
+        // check_us가 P2 rise 이후인지 확인
+        if (!time_after_eq_u32(check_us, p->rise_us)) {
+            continue;
+        }
+
+        // 아직 fall이 기록되지 않았다면 현재까지 High로 판단
+        if (!p->low_seen) {
+            return true;
+        }
+
+        // fall_us가 check_us 이후 또는 같은 시점이면 check_us 당시 High
+        if (time_after_eq_u32(p->fall_us, check_us)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void signal_detector_reset(void)
+{
+    signal_snapshot_t s;
+    signal_get_snapshot(&s);
+
+    sig_state = SIG_IDLE;
+    active_p1_rise_us = 0;
+    active_p1_fall_us = 0;
+    active_p1_rise_seq = 0;
+    sig_cooldown_start_us = 0;
+
+    // reset 전에 이미 들어온 P1은 처리하지 않음
+    last_used_p1_rise_seq = s.p1_rise_seq;
+}
+
+static void signal_detector_update(void)
+{
+    /*
+     * control_signal이 false면 감지하지 않음
+     * first_channel_ban은 기존 채널 무시 정책 유지
+     */
+    if (!control_signal || first_channel_ban) {
+        signal_detector_reset();
+        return;
+    }
+
+    signal_snapshot_t s;
+    signal_get_snapshot(&s);
+
+    uint32_t now = time_us_32();
+
+    switch (sig_state) {
+    case SIG_IDLE:
+        if (s.p1_rise_seq != 0 &&
+            s.p1_rise_seq != last_used_p1_rise_seq) {
+
+            active_p1_rise_us = s.p1_rise_us;
+            active_p1_rise_seq = s.p1_rise_seq;
+            last_used_p1_rise_seq = s.p1_rise_seq;
+
+            sig_state = SIG_CONFIRM_P1;
+        }
+        break;
+
+    case SIG_CONFIRM_P1:
+        /*
+         * P1 상승 후 이미 하강이 들어온 경우:
+         * High 폭으로 유효성 판단
+         */
+        if (s.p1_fall_seq > active_p1_rise_seq) {
+            uint32_t width = s.p1_fall_us - active_p1_rise_us;
+
+            if (width >= P1_CONFIRM_US) {
+                active_p1_fall_us = s.p1_fall_us;
+                sig_state = SIG_WAIT_P2_JUDGE;
+            }
+            else {
+                sig_state = SIG_IDLE;
+            }
+
+            break;
+        }
+
+        /*
+         * 아직 P1이 High 상태이고 5ms가 지났다면:
+         * 유효 P1로 인정하고 fall 대기
+         */
+        if (time_reached_u32(now, active_p1_rise_us + P1_CONFIRM_US)) {
+            if (s.p1_high) {
+                sig_state = SIG_WAIT_P1_FALL;
+            }
+            else {
+                sig_state = SIG_IDLE;
+            }
+        }
+        break;
+
+    case SIG_WAIT_P1_FALL:
+        if (s.p1_fall_seq > active_p1_rise_seq) {
+            active_p1_fall_us = s.p1_fall_us;
+            sig_state = SIG_WAIT_P2_JUDGE;
+        }
+        break;
+
+    case SIG_WAIT_P2_JUDGE:
+        /*
+         * P1 fall + 2ms까지 지난 뒤 판정
+         */
+        if (time_reached_u32(now, active_p1_fall_us + P2_CHECK2_US)) {
+            uint32_t t_check1 = active_p1_fall_us + P2_CHECK1_US;
+            uint32_t t_check2 = active_p1_fall_us + P2_CHECK2_US;
+
+            bool p2_c1 = p2_was_high_at_time(&s, t_check1);
+            bool p2_c2 = p2_was_high_at_time(&s, t_check2);
+
+            if ((p2_c1 || p2_c2) && !second_channel_ban) {
+                // critical
+                hit_channel = 2;
+                cri_hit_count += 1;
+            }
+            // if (p2_c1 && p2_c2 && !second_channel_ban) {
+            //     // critical
+            //     hit_channel = 2;
+            //     cri_hit_count += 1;
+            // }
+            else {
+                // non-critical
+                // DETECT_1과 DETECT_3을 하나로 묶은 P1 계열로 처리
+                hit_channel = 1;
+                non_cri_hit_count += 1;
+            }
+
+            sig_cooldown_start_us = now;
+            sig_state = SIG_COOLDOWN;
+        }
+        break;
+
+    case SIG_COOLDOWN:
+        if ((uint32_t)(now - sig_cooldown_start_us) >= DETECT_COOLDOWN_US) {
+            signal_get_snapshot(&s);
+            last_used_p1_rise_seq = s.p1_rise_seq;
+            sig_state = SIG_IDLE;
+        }
+        break;
+
+    default:
+        sig_state = SIG_IDLE;
+        break;
+    }
+}
+
+static void detect_channel_ban(void)
+{
+    /*
+     * 현재 하드웨어는 P1, P2 두 입력만 사용
+     * SBC 데이터는 ch1/ch2/ch3 구조이므로 P1 계열은 ch1 또는 ch3가 모두 off일 때만 ban 처리
+     */
+    first_channel_ban = (Receive_Data[2] == 1 && Receive_Data[4] == 1);
+    second_channel_ban = (Receive_Data[3] == 1);
+}
+
+void gain_pwm_set(uint8_t gain_pwm)
+{
+    if (gain_pwm > 254u) {
+        gain_pwm = 254u;
+    }
+
+    current_gain_pwm = gain_pwm;
+    pwm_set_gpio_level(GAIN, current_gain_pwm);
+}
