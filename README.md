@@ -2,6 +2,12 @@ Work in progress — detailed description coming soon
 
 기존 파일 전부 제거 신규 작업
 
-M10_MCU2 -> 구버전 ACT 사용
+M10_MCU2 -→ 구버전 ACT 사용
 
-nuri_motor -> 신버전 절대엔코더장착형 모터 사용
+nuri_motor → 신버전 절대엔코더장착형 모터 사용
+
+<---261030--->
+
+ - MOO_MCU2 제거 해당 버전은 따로 관리
+
+ - 신규 적용 모터만 관리
