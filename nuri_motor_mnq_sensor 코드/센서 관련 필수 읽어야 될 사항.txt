@@ -1,0 +1,103 @@
+'active_low(sensing_debug)' 폴더 내부 코드 기준 설명
+
+* 왜 이렇게까지 데이터를 얻어서 테스트를 하느냐?
+ A) 오실로스코프로 읽어들어이는 거랑 Pico가 실제로 읽는 것은 다를 수 있음을 유의해야 함 꼭 오실로스코프상으로 나온 결과 값이 옳다라고 하는건 억지임을 강조하기 위함
+ B) 오실로스코프에서는 짧은 펄스다 긴 펄스가 찍혔다고 해서 Pico 내부에서는 전혀 다른 펄스를 볼 수 있음을 알아야 함
+ C) 오실로스코프가 센서 출력쪽에서 보았는지 Pico GPIO핀 바로 앞에서 봤는지에 따라 다름, 중간 회로가 들어갔을 경우 아래 사항에 따라 Pico가 실제로 보는 것은 오실로스코프의 아날로그 파형 전체가 아니라, GPIO 입력 threshold를 넘었는지/안 넘었는지가 중요함
+  C-1) 센서 쪽 파형은 길다 하지만 중간 회로 통과 후 Pico GPIO에서는 짧다
+  C-2) 센서 쪽에서는 정상처럼 보인다 하지만 Pico 입력 전압 threshold 기준으로는 HIGH/LOW가 애매하다
+  = 그래서 오실로스코프상 길어 보이는 신호와 Pico가 인식한 digital edge가 다를 수 있음
+
+1. Pico가 읽어들인 데이터 확인
+ - 오실로스코프 데이터와 Pico가 실제로 읽어들인 데이터 차이가 있을 수 있기에 센서 알고리즘 기준으로 pico가 읽어들인 데이터를 모두 나열함 (각 항목에 대한 설명은 아래에 나열함)
+
+ A) 'debug_sensor_260701.txt'기준 설명
+  - Pico에서 인터럽트가 빠지거나 Rise/Fall 한 쪽이 누락되는 현상은 아직까지 없었음
+  - both-edge 문제는 있긴 한데 해당 문제가 감지를 못했다의 주 원인은 아님
+    (B=1  → FALL/RISE가 같은 callback에 같이 들어온 경우 1번)
+    (BL=1 → 그 때문에 pulse 폭을 잃어버린 의심 1번)
+  - Pico는 실제 Hit 신호를 9번 전달 함 (V=9, H1=8, H2=1) => 만약 SBC나 상위 ROS 쪽에서 감지가 안 됐다고 보였다면, 그건 Pico 센서 알고리즘이 0으로 끝난 게 아니라 SBC 출력/퍼블리시 방식 문제일 가능성
+  - P1 폭 자체도 정상적으로 잡히고 있음, LW는 마지막 P1 pulse 폭 => 즉 오실로스코프에서 펄스 구간이 긴 것이 있다면 P1의 Low pulse가 Pico 내부에서도 비슷한 폭으로 잡히는 케이스임
+  - 코드 기준 P1 유효 조건은 P1_CONFIRM_US=150us임, P1_P2_DELAY_US=1000us, P2_CONFIRM_US=1500us로 설정되어 있음 => 그래서 LW=472, 521, 580, 935 같은 값은 P1 기준으로는 충분히 유효
+  - Pico에서 감지는 하였고 실제 SBC나 상위 ROS 쪽에서도 감지 값이 나왔는데 모터가 움직이지 않았다면, 그건 모터의 평시 상태 각도 값을 벗어났기 때문, 모터가 어떤 상태(Up/Down)에 따라 제한 각도 범위가 있음 그 각도 범위를 벗어날 경우 모터는 Reset 명령을 받지 않는 이상 제어 불가
+
+  [기타] P=39인데 V=9밖에 없느냐에 대한 설명 (P=39 → Pico가 본 P1 raw pulse 개수, V=9  → 그중 실제 판정에 사용된 유효 P1 개수)
+   - 음향 센서는 한 번 반응할 때 여러 pulse가 나올 수 있음
+   - 한 번 타격/음향 이벤트에서 P1 500us / P1 10us / P1 200us / P1 50us 등 처럼 여러 개가 나올 수 있음
+   - 여기서 모든 pulse를 hit로 잡으면 오히려 오검출/중복검출이 됨
+   - 그래서 DETECT_COOLDOWN_US=70000us라는 변수가 있고, 판정 후 일정 시간은 중복 감지를 막음, 해당 값도 코드에 정의되어 있음
+   - 따라서 P가 많고 V/H가 적은 건 어느 정도 정상
+   - 다만 정확히 몇 번 타격했는지와 비교해야 함
+   - 실제 타격이 9번 정도였다 → Pico는 거의 정상 / 실제 타격이 15번 이상이었다 → 일부는 조건/쿨다운/상위 필터에서 빠짐
+
+    * 주의: active_low_debug.c 코드는 Nurimotor 1번 파라미터가 적용되었음
+    * 항목 설명
+        F    = P1 FALL edge 누적 개수
+        R    = P1 RISE edge 누적 개수
+        B    = P1 FALL+RISE가 같은 callback에 같이 들어온 횟수
+        BL   = both-edge 때문에 실제 pulse 폭을 잃어버린 의심 횟수
+        P    = 완성된 P1 pulse 개수
+        S    = P1_SHORT 개수
+        V    = P1 valid 개수
+        Rwo  = RISE without active, 시작 FALL 없이 RISE만 들어온 횟수
+        Fwa  = FALL while active, 이미 LOW 상태인데 FALL이 또 들어온 횟수
+        OW   = P1 history overwrite 의심 횟수
+        LW   = 마지막 P1 pulse 폭
+        SW   = 마지막 short P1 pulse 폭
+        VW   = 마지막 valid P1 pulse 폭
+        H1   = channel 1 판정 누적
+        H2   = channel 2 판정 누적
+    
+    * 각 항목 별 판단
+        F/R 증가 없음
+        → Pico GPIO19까지 edge가 안 들어온 것
+
+        F/R 증가, P 증가, S 증가, V 증가 없음
+        → edge는 들어오지만 pulse 완성/처리 전 단계 문제
+
+        B 또는 BL 증가
+        → FALL/RISE가 한 callback에 같이 들어와 pulse 폭을 잃는 문제 가능성 큼
+
+        P 증가, S 증가, LW < 150(우리가 설정 해주는 P1 유효 확인 시간)
+        → Pico 내부에서는 P1 폭이 짧게 계산됨
+
+        P 증가, V 증가, H1/H2 증가 없음
+        → P1은 valid인데 이후 상태머신/전송 쪽 문제
+
+        V 증가, H1/H2 증가
+        → 감지는 됐고, 상위에서 안 보이는 문제
+
+
+
+2. 시간 판정이나 시간은 어떻게 아느냐에 대한 답
+ - edge timestamp 방식으로 Pico에서 GPIO 인터럽트가 들어오면 바로 시간을 찍음 → uint32_t now = time_us_32();
+ 1. P1 Fall(또는 Rise) 발생 시각을 저장 => p1_start
+ 2. P1 Rise(또는 Fall) 발생 시각을 저장 => p1_end
+ 3. P1 Low(또는 High) 유지시간 = p1_start - p1_end
+ 4. 해당 값이 설정 시간 값 이상이면 유효 미만이면 버림 (예시. p1_start - p1_end >= 150us)
+  * 150us는 어떻게 아느냐 => pico 자체 시간
+ 5. delay는 P1이 끝난뒤 delay 지난 시점 → 예시. t_check = p1_end + 1000us
+
+ * 번 외 설명 
+  a) 시각은 어떻게 확인되나
+    - pico 내부에는 부팅 후 계속 증가하는 마이크로초 타이머가 있음
+    - 코드에서는 인터럽트 콜백 안에서 이를 읽음 'uint32_t now = time_us_32();'
+    - falling(or rising)이 들어오면 그 시각을 저장
+      if (events & GPIO_IRQ_EDGE_FALL) {
+        isr_p1_start_us = now;
+        p1_irq_start_us = now;
+      }
+    - 의미는 'T0 = 실제 전기 신호가 FALL 된 정확한 순간'이라기 보다는 'T0 = Pico가 P1 FALL 인터럽트 콜백에 들어와서 time_us_32()를 읽은 시각' 임
+    - 보통은 실제 FALL(or Rise) 시점과 거의 비슷하지만, 인터럽트가 잠깐 지연되면 몇 us 정도 차이는 날 수 있음
+  
+  b) 1000us = 1ms는 Pico가 어떻게 아나
+    - time_us_32() 자체가 마이크로초 단위 값을 반환함
+    - 그래서 코드에서 '#define P1_CONFIRM_US 1000u' 라고 변수를 지정하면 이 값의 단위는 코드상 'us' 즉 microsecond로 쓰임
+    - 확인 시간은 아래 처럼 계산됨
+    - uint32_t p1_confirm_time_us = active_p1_start_us + P1_CONFIRM_US;
+    - 예를 들어 P1 FALL 시각이 'active_p1_start_us = 500000' 이라면 확인 시각은 'p1_confirm_time_us = 500000 + 1000 = 5010000', 즉 Pico 시간 기준으로 1ms 뒤임
+    - 그리고 main loop에서 현재 시간이 그 시각을 지났는지 봄
+      if (time_reached_u32(now, p1_confirm_time_us)) {
+          // 1ms 지남
+      }
+    - 정리 : time_us_32() 단위 = us, 1000us = 1ms 따라서 start_us + 1000 = FALL 후 1ms

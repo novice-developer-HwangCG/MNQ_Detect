@@ -1,0 +1,9 @@
+P1 TRACE
+start: p1_start    end: p1_end
+width: Pico가 보낸 p1_width    calc: UI에서 end-start 계산값    valid: 150us 이상 여부
+seq: p1_seq        F/R: p1_fall/p1_rise
+
+F/R 변화 없음 → Pico가 P1 인터럽트 자체를 못 봄
+F만 증가, R/seq 변화 없음 → FALL은 봤지만 RISE 못 봄
+seq 증가 + width/calc 150us 이상 → Pico는 P1을 정상 인식함, 이후 hit/motor 루트 문제
+seq 증가 + width/calc 150us 미만 → Pico는 봤지만 짧다고 판단
